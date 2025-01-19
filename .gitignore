@@ -35,6 +35,7 @@ bower_components
 .lock-wscript
 
 # Compiled binary addons (https://nodejs.org/api/addons.html)
+build/
 build/Release
 
 # Dependency directories
@@ -86,3 +87,5 @@ typings/
 
 # DynamoDB Local files
 .dynamodb/
+
+stag_updater_settings.ini
