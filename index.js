@@ -5,6 +5,8 @@ const iconv = require('iconv-lite');
 const path = require('path');
 const yesno = require('yesno');
 const inquirer = require('inquirer');
+const png = require('pngjs').PNG;
+const bmp = require('bmp-ts');
 
 const settingsFile = './stag_updater_settings.ini';
 
@@ -71,10 +73,38 @@ async function promptForDirectory() {
 
 let stagDirectory = path.resolve(__dirname, '..'); // Stag adresář
 
+// https://github.com/npm/ini/issues/22#issuecomment-1426581205
+function flattenIniObject(obj)
+{
+    function _flattenIniObject(obj, topLevel = [], resp = {}) {
+        let props = {};
+        for(let key in obj) {
+            if(typeof obj[key] == 'object') {
+                topLevel.push(key);
+                resp = { ...resp, ..._flattenIniObject(obj[key], topLevel, resp)}
+            }
+            else
+                props[key] = obj[key];
+        }
+
+        const topLevelName = topLevel.join(".");
+        if(topLevelName !== '' && Object.keys(props).length > 0)
+            resp = { ...resp, [topLevelName]: props}
+
+        topLevel.pop();
+        return resp;
+    }
+
+    return _flattenIniObject(obj);
+}
+
 function readIniFile(filePath) {
     const rawData = fs.readFileSync(filePath);
-    const decodedData = iconv.decode(rawData, 'windows1250');
-    return ini.parse(decodedData);
+    const decodedData = iconv.decode(rawData, 'windows-1250');
+    const iniData = ini.parse(decodedData);
+
+    const flat = flattenIniObject(iniData);
+    return flat;
 }
 
 let vozy = "";
@@ -106,14 +136,15 @@ async function getServerVersion() {
 async function downloadDefinitions() {
     console.log("Stahuji novou definici vozů...")
     try {
-        const response = await axios.get(`${baseUrl}getvini.php`);
+        const response = await axios.get(`${baseUrl}getvini.php`, { responseType: 'arraybuffer' });
         console.log('Definice stažena... - aktualizuji')
 
         // Save the new definitions to the local ini file
-        const decodedData = iconv.decode(Buffer.from(response.data), 'windows1250');
-        fs.writeFileSync(path.join(stagDirectory, 'vozy/vozy.ini'), decodedData);
-
-        vozy = ini.parse(decodedData);
+        const decodedData = iconv.decode(response.data, 'windows-1250'); // nejdřív dekódujeme do UTF-8 pro ini parser
+        vozyNotFlat = ini.parse(decodedData);
+        vozy = flattenIniObject(vozyNotFlat);
+        const encodedData = iconv.encode(decodedData, 'windows-1250'); // zakódujeme zpátky do win-1250 pro zápis do souboru (nevim jestli by nešlo prostě zapsat celej response.data bez úprav)
+        fs.writeFileSync(path.join(stagDirectory, 'vozy/vozy.ini'), encodedData);
 
         await downloadCarImages();
 
@@ -128,6 +159,29 @@ function formatLogLine(logMessage, current, total) {
     const percentage = ((current / total) * 100).toFixed(2);
     const paddedMessage = logMessage.padEnd(maxLogWidth, '.');
     return `${paddedMessage}${percentage.padStart(6, '.')}%`;
+}
+
+function convertRGBAToABGR(rgbaBuffer) {
+    if (rgbaBuffer.length % 4 !== 0) {
+        throw new Error("Invalid RGBA buffer length.");
+    }
+
+    const abgrBuffer = Buffer.alloc(rgbaBuffer.length);
+
+    for (let i = 0; i < rgbaBuffer.length; i += 4) {
+        // RGBA to ABGR
+        const r = rgbaBuffer[i];     // Red
+        const g = rgbaBuffer[i + 1]; // Green
+        const b = rgbaBuffer[i + 2]; // Blue
+        //const a = rgbaBuffer[i + 3]; // Alpha - celá černá, takže neni potřeba brát ji z png
+
+        abgrBuffer[i] = 0;     // Alpha - celá černá, takže 0
+        abgrBuffer[i + 1] = b; // Blue
+        abgrBuffer[i + 2] = g; // Green
+        abgrBuffer[i + 3] = r; // Red
+    }
+
+    return abgrBuffer;
 }
 
 async function downloadCarImages() {
@@ -160,11 +214,41 @@ async function downloadCarImages() {
                         }
                     );
 
+                    // Přečteme buffer png a dekódujeme raw image byty
+                    const buffer = Buffer.from(response.data);
+                    const decodedPng = png.sync.read(buffer);
+
+                    // Převrátíme channely z RGBA do ABGR (pro BMP enkodér)
+                    decodedPng.data = convertRGBAToABGR(decodedPng.data);
+
+                    // Uložíme raw image byty (s převrácenými channely do 32bit BMP)
+                    const bmpData = {
+                        data: decodedPng.data,
+                        width: decodedPng.width,
+                        height: decodedPng.height,
+                        bitPP: 32
+                    };
+                    const encodedBmp = bmp.encode(bmpData);
+
+                    // Z nějakýho důvodu BMP enkodér přidává na konec 2 01 01 byty, takže je odebereme a rekalkulujeme image size byty v headerech
+                    if (encodedBmp.data.length >= 2) {
+                        encodedBmp.data = encodedBmp.data.subarray(0, encodedBmp.data.length - 2);
+                    }
+                    
+                    // Update file size in the header (offset 0x2, 4 bytes)
+                    const newFileSize = encodedBmp.data.length;
+                    encodedBmp.data.writeUInt32LE(newFileSize, 2);
+                    
+                    // Update image size in the header (offset 0x22, 4 bytes)
+                    const newImageSize = decodedPng.width * decodedPng.height * 4; // 4 bytes per pixel
+                    encodedBmp.data.writeUInt32LE(newImageSize, 0x22);
+
+                    // Uložíme BMP
                     const fileName = imageIndex === 0
                         ? `vuz_${section}.bmp`
                         : `vuz__${imageIndex}_${section}.bmp`;
 
-                    fs.writeFileSync(path.join(stagDirectory, 'vozy', fileName), response.data);
+                    fs.writeFileSync(path.join(stagDirectory, 'vozy', fileName), encodedBmp.data);
 
                     imageIndex++;
                 } while (imageIndex <= parseInt(vozy[section].imgex || '0'));
