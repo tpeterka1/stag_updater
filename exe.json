@@ -1,0 +1,11 @@
+{
+    "entry": "index.js",
+    "out": "build/stag_updater.exe",
+    "skipBundle": false,
+    "icon": "ikona.ico",
+    "executionLevel": "asInvoker",
+    "properties": {
+        "FileDescription": "Neoficiální STAG Aktualizátor",
+        "ProductName": "STAG Updater"
+    }
+}
